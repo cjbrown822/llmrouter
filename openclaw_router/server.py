@@ -11,14 +11,18 @@ Or directly:
 """
 
 import json
+import hashlib
 import os
 import re
 import sys
-from typing import AsyncGenerator, Optional, Dict, Any, List
+import time
+import uuid
+from collections import OrderedDict
+from typing import AsyncGenerator, AsyncIterator, Optional, Dict, Any, List, Tuple
 
 # Check dependencies
 try:
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
     from fastapi.responses import StreamingResponse
     from pydantic import BaseModel
     import httpx
@@ -54,12 +58,42 @@ class ChatRequest(BaseModel):
     model: str = "auto"
     messages: List[Message]
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
     max_tokens: Optional[int] = 4096
     stream: Optional[bool] = False
     user: Optional[str] = None  # Optional user id (used for memory scoping if enabled)
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
     stream_options: Optional[Dict[str, Any]] = None
+    parallel_tool_calls: Optional[bool] = None
+
+
+class ResponsesRequest(BaseModel):
+    """Subset of the Responses API request accepted by Codex.
+
+    Unknown fields are intentionally ignored by Pydantic so newer Codex clients
+    can add metadata without breaking older router deployments.
+    """
+
+    model: str = "auto"
+    input: Any = ""
+    instructions: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    stream: bool = False
+    store: Optional[bool] = False
+    user: Optional[str] = None
+    safety_identifier: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
+    reasoning: Optional[Dict[str, Any]] = None
+    text: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    previous_response_id: Optional[str] = None
+    truncation: Optional[str] = None
 
 
 # ============================================================
@@ -76,6 +110,12 @@ def normalize_content(content: Any) -> str:
             if isinstance(part, dict):
                 if part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
+                elif part.get("type") in {"image_url", "image"}:
+                    text_parts.append("[Image input]")
+                elif part.get("type") in {"audio", "input_audio"}:
+                    text_parts.append("[Audio input]")
+                elif part.get("type") == "video":
+                    text_parts.append("[Video input]")
                 elif "text" in part:
                     text_parts.append(part.get("text", ""))
             elif isinstance(part, str):
@@ -120,27 +160,110 @@ def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
 
 def estimate_tokens(text: str) -> int:
     """Estimate token count (approx 4 chars = 1 token)"""
-    return len(text) // 4
+    return (len(text) + 3) // 4
 
 
-def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int) -> int:
-    """Adjust max_tokens based on context limit"""
-    context_limit = MODEL_CONTEXT_LIMITS.get(model_id, 32768)
+CONTEXT_SAFETY_TOKENS = 100
+PRICE_TOKEN_UNIT = 1_000_000
 
-    input_text = " ".join(m.get("content", "") for m in messages)
-    input_tokens = estimate_tokens(input_text)
 
-    available = context_limit - input_tokens - 100
-    if available < 100:
-        available = 100
+def estimate_request_tokens(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Estimate prompt tokens, including tool schemas and tool-call history."""
+    parts: List[str] = []
+    for message in messages:
+        parts.append(str(message.get("role") or ""))
+        parts.append(normalize_content(message.get("content")))
+        if message.get("tool_calls") is not None:
+            parts.append(json.dumps(message["tool_calls"], separators=(",", ":"), default=str))
+        if message.get("function_call") is not None:
+            parts.append(json.dumps(message["function_call"], separators=(",", ":"), default=str))
+        if message.get("tool_call_id") is not None:
+            parts.append(str(message["tool_call_id"]))
+    if tools:
+        parts.append(json.dumps(tools, separators=(",", ":"), default=str))
+    return estimate_tokens(" ".join(parts))
 
-    result = min(requested_max, available)
+
+def _configured_context_limit(llm: LLMConfig) -> int:
+    configured = int(llm.context_limit or 0)
+    if configured > 0:
+        return configured
+    return int(MODEL_CONTEXT_LIMITS.get(llm.model_id, 32768))
+
+
+def _eligible_models_for_request(
+    config: OpenClawConfig,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[str], int]:
+    input_tokens = estimate_request_tokens(messages, tools)
+    eligible = [
+        name
+        for name, llm in config.llms.items()
+        if input_tokens + CONTEXT_SAFETY_TOKENS < _configured_context_limit(llm)
+    ]
+    return eligible, input_tokens
+
+
+def adjust_max_tokens(
+    messages: List[Dict[str, Any]],
+    llm: LLMConfig,
+    requested_max: Optional[int],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Clamp output tokens to the selected model's configured limits."""
+    context_limit = _configured_context_limit(llm)
+    input_tokens = estimate_request_tokens(messages, tools)
+    available = context_limit - input_tokens - CONTEXT_SAFETY_TOKENS
+    if available < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Input requires approximately {input_tokens} tokens, which exceeds "
+                f"the configured context limit for '{llm.name}' ({context_limit})."
+            ),
+        )
+
+    configured_max = max(1, int(llm.max_tokens or 4096))
+    desired_max = configured_max if requested_max is None else int(requested_max)
+    if desired_max < 1:
+        raise HTTPException(status_code=400, detail="max_tokens must be greater than zero")
+    result = min(desired_max, configured_max, available)
 
     # NVIDIA API limits max_tokens to 1024
-    if model_id in MODELS_WITHOUT_SYSTEM_ROLE:
+    if llm.model_id in MODELS_WITHOUT_SYSTEM_ROLE:
         result = min(result, 1024)
 
     return result
+
+
+def calculate_usage_cost(llm: LLMConfig, usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Calculate request cost using configured USD-per-million-token prices."""
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    input_cost = input_tokens * float(llm.input_price or 0.0) / PRICE_TOKEN_UNIT
+    output_cost = output_tokens * float(llm.output_price or 0.0) / PRICE_TOKEN_UNIT
+    return {
+        "model": llm.name,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "input_cost_usd": round(input_cost, 12),
+        "output_cost_usd": round(output_cost, 12),
+        "total_cost_usd": round(input_cost + output_cost, 12),
+        "price_unit": "usd_per_1m_tokens",
+    }
+
+
+def _log_usage_cost(llm: LLMConfig, usage: Optional[Dict[str, Any]]) -> None:
+    record = calculate_usage_cost(llm, usage)
+    if record is not None:
+        _safe_log(f"[Usage] {json.dumps(record, separators=(',', ':'), sort_keys=True)}")
 
 
 def clean_response(result: Dict) -> Dict:
@@ -329,6 +452,963 @@ async def _prepend_chunk(first_chunk: Optional[str], rest: AsyncGenerator) -> As
 
 
 # ============================================================
+# Responses API compatibility (used by Codex custom providers)
+# ============================================================
+
+# chat-safe name -> (Responses tool kind, optional namespace, original name)
+ToolNameMap = Dict[str, Tuple[str, Optional[str], str]]
+
+
+def _new_api_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _chat_safe_tool_name(name: str, used: ToolNameMap) -> str:
+    """Return a unique Chat Completions-compatible function name."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", name or "tool")
+    if len(cleaned) > 64:
+        suffix = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:10]
+        cleaned = f"{cleaned[:53]}_{suffix}"
+
+    candidate = cleaned or "tool"
+    counter = 2
+    while candidate in used:
+        suffix = f"_{counter}"
+        candidate = f"{cleaned[:64 - len(suffix)]}{suffix}"
+        counter += 1
+    return candidate
+
+
+def _function_tool_to_chat(
+    tool: Dict[str, Any],
+    namespace: Optional[str],
+    name_map: ToolNameMap,
+) -> Optional[Dict[str, Any]]:
+    if tool.get("type") != "function" or not tool.get("name"):
+        return None
+
+    original_name = str(tool["name"])
+    qualified_name = f"{namespace}__{original_name}" if namespace else original_name
+    chat_name = _chat_safe_tool_name(qualified_name, name_map)
+    name_map[chat_name] = ("function", namespace, original_name)
+
+    function: Dict[str, Any] = {
+        "name": chat_name,
+        "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+    }
+    if tool.get("description") is not None:
+        function["description"] = tool["description"]
+    if tool.get("strict") is not None:
+        function["strict"] = tool["strict"]
+    return {"type": "function", "function": function}
+
+
+def _custom_tool_to_chat(
+    tool: Dict[str, Any],
+    namespace: Optional[str],
+    name_map: ToolNameMap,
+) -> Optional[Dict[str, Any]]:
+    """Wrap a Responses freeform custom tool in a JSON function argument."""
+    if tool.get("type") != "custom" or not tool.get("name"):
+        return None
+
+    original_name = str(tool["name"])
+    qualified_name = f"{namespace}__{original_name}" if namespace else original_name
+    chat_name = _chat_safe_tool_name(qualified_name, name_map)
+    name_map[chat_name] = ("custom", namespace, original_name)
+
+    description = str(tool.get("description") or f"Run the {original_name} custom tool.")
+    description += " Pass the custom tool's complete raw input in the `input` string."
+    return {
+        "type": "function",
+        "function": {
+            "name": chat_name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "Complete raw input for the custom tool.",
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _tool_search_to_chat(tool: Dict[str, Any], name_map: ToolNameMap) -> Dict[str, Any]:
+    """Expose Codex's client-executed tool search to Chat backends."""
+    chat_name = _chat_safe_tool_name("tool_search", name_map)
+    name_map[chat_name] = ("tool_search", None, "tool_search")
+    return {
+        "type": "function",
+        "function": {
+            "name": chat_name,
+            "description": tool.get("description") or "Search for additional tools by capability.",
+            "parameters": tool.get("parameters")
+            or {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def responses_tools_to_chat(
+    tools: Optional[List[Dict[str, Any]]],
+) -> Tuple[Optional[List[Dict[str, Any]]], ToolNameMap]:
+    """Flatten Responses function/namespace tools for Chat Completions backends."""
+    if not tools:
+        return None, {}
+
+    converted: List[Dict[str, Any]] = []
+    name_map: ToolNameMap = {}
+    for tool in tools:
+        tool_type = tool.get("type")
+        if tool_type == "function":
+            converted_tool = _function_tool_to_chat(tool, None, name_map)
+            if converted_tool:
+                converted.append(converted_tool)
+        elif tool_type == "custom":
+            converted_tool = _custom_tool_to_chat(tool, None, name_map)
+            if converted_tool:
+                converted.append(converted_tool)
+        elif tool_type == "tool_search":
+            converted.append(_tool_search_to_chat(tool, name_map))
+        elif tool_type == "namespace":
+            namespace = str(tool.get("name") or "namespace")
+            for child in tool.get("tools") or []:
+                if child.get("type") == "custom":
+                    converted_tool = _custom_tool_to_chat(child, namespace, name_map)
+                else:
+                    converted_tool = _function_tool_to_chat(child, namespace, name_map)
+                if converted_tool:
+                    converted.append(converted_tool)
+
+    return converted or None, name_map
+
+
+def _responses_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+
+    parts: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+
+        part_type = part.get("type")
+        if part_type in {"input_text", "output_text", "text", "reasoning_text"}:
+            parts.append(str(part.get("text") or ""))
+        elif part_type == "refusal":
+            parts.append(str(part.get("refusal") or ""))
+        elif part_type == "input_image":
+            image_ref = part.get("image_url") or part.get("file_id") or "image"
+            parts.append(f"[Image input: {image_ref}]")
+        elif part_type == "input_file":
+            file_ref = part.get("filename") or part.get("file_id") or part.get("file_url") or "file"
+            parts.append(f"[File input: {file_ref}]")
+    return "\n".join(part for part in parts if part)
+
+
+def _responses_content_to_chat(content: Any) -> Any:
+    """Preserve supported Responses media for the existing media pipeline."""
+    if not isinstance(content, list):
+        return _responses_content_to_text(content)
+
+    chat_parts: List[Dict[str, Any]] = []
+    has_media = False
+    for part in content:
+        if isinstance(part, str):
+            chat_parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+
+        part_type = str(part.get("type") or "")
+        if part_type in {"input_text", "output_text", "text", "reasoning_text"}:
+            text = str(part.get("text") or "")
+            if text:
+                chat_parts.append({"type": "text", "text": text})
+        elif part_type == "refusal":
+            text = str(part.get("refusal") or "")
+            if text:
+                chat_parts.append({"type": "text", "text": text})
+        elif part_type == "input_image":
+            has_media = True
+            image_url = part.get("image_url")
+            image_ref = part.get("file_id") or "image"
+            if image_url and not str(image_url).startswith("data:"):
+                image_ref = image_url
+            chat_parts.append({"type": "text", "text": f"[Image input: {image_ref}]"})
+            if image_url:
+                image_value: Dict[str, Any] = {"url": str(image_url)}
+                if part.get("detail") is not None:
+                    image_value["detail"] = part["detail"]
+                chat_parts.append({"type": "image_url", "image_url": image_value})
+        elif part_type == "input_audio":
+            has_media = True
+            audio = part.get("input_audio") if isinstance(part.get("input_audio"), dict) else part
+            data = audio.get("data") if isinstance(audio, dict) else None
+            chat_parts.append({"type": "text", "text": "[Audio input]"})
+            if data:
+                chat_parts.append(
+                    {
+                        "type": "input_audio",
+                        "data": data,
+                        "mime_type": audio.get("mime_type") or audio.get("format") or "audio/mp3",
+                    }
+                )
+        elif part_type == "input_file":
+            file_ref = (
+                part.get("filename")
+                or part.get("file_id")
+                or part.get("file_url")
+                or "file"
+            )
+            chat_parts.append({"type": "text", "text": f"[File input: {file_ref}]"})
+
+    if not has_media:
+        return "\n".join(
+            str(part.get("text") or "")
+            for part in chat_parts
+            if part.get("type") == "text" and part.get("text")
+        )
+    return chat_parts
+
+
+def _mapped_chat_tool_name(
+    name: str,
+    namespace: Optional[str],
+    name_map: ToolNameMap,
+    kind: str = "function",
+) -> str:
+    for chat_name, mapped in name_map.items():
+        if mapped == (kind, namespace, name):
+            return chat_name
+    # This can happen when a client resends history but omits the old tool list.
+    qualified = f"{namespace}__{name}" if namespace else name
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", qualified)[:64] or "tool"
+
+
+def _responses_tool_choice_to_chat(choice: Any, name_map: ToolNameMap) -> Any:
+    if not isinstance(choice, dict):
+        return choice
+    choice_type = str(choice.get("type") or "")
+    if choice_type not in {"function", "custom"} or not choice.get("name"):
+        # Chat Completions has no equivalent for namespace/allowed-tools choices.
+        return "auto"
+    name = _mapped_chat_tool_name(
+        str(choice["name"]),
+        str(choice["namespace"]) if choice.get("namespace") else None,
+        name_map,
+        choice_type,
+    )
+    return {"type": "function", "function": {"name": name}}
+
+
+def _append_chat_tool_call(messages: List[Dict[str, Any]], tool_call: Dict[str, Any]) -> None:
+    if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
+        messages[-1]["tool_calls"].append(tool_call)
+    else:
+        messages.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
+
+
+def _tool_output_to_text(output: Any) -> str:
+    if isinstance(output, (dict, list)):
+        if isinstance(output, list) and all(isinstance(part, (dict, str)) for part in output):
+            text = _responses_content_to_text(output)
+            if text:
+                return text
+        return json.dumps(output, separators=(",", ":"))
+    return _responses_content_to_text(output)
+
+
+def responses_request_to_chat(
+    request: ResponsesRequest,
+) -> Tuple[ChatRequest, ToolNameMap]:
+    """Translate a Responses request into the existing Chat Completions path."""
+    chat_tools, name_map = responses_tools_to_chat(request.tools)
+    messages: List[Dict[str, Any]] = []
+    system_parts: List[str] = []
+    if request.instructions:
+        system_parts.append(request.instructions)
+
+    input_items = request.input
+    if isinstance(input_items, str):
+        input_items = [{"type": "message", "role": "user", "content": input_items}]
+    elif isinstance(input_items, dict):
+        input_items = [input_items]
+    elif not isinstance(input_items, list):
+        input_items = []
+
+    for item in input_items:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type", "message")
+        if item_type == "message":
+            role = str(item.get("role") or "user")
+            if role in {"system", "developer"}:
+                content = _responses_content_to_text(item.get("content"))
+                if content:
+                    system_parts.append(content)
+            else:
+                content = _responses_content_to_chat(item.get("content"))
+                messages.append({"role": role, "content": content})
+        elif item_type in {"function_call", "custom_tool_call", "tool_search_call"}:
+            kind = {
+                "function_call": "function",
+                "custom_tool_call": "custom",
+                "tool_search_call": "tool_search",
+            }[item_type]
+            name = str(item.get("name") or "tool")
+            if kind == "tool_search":
+                name = "tool_search"
+            namespace = str(item["namespace"]) if item.get("namespace") else None
+            if kind == "custom":
+                arguments = json.dumps({"input": str(item.get("input") or "")})
+            elif kind == "tool_search":
+                raw_arguments = item.get("arguments") or {}
+                arguments = (
+                    raw_arguments
+                    if isinstance(raw_arguments, str)
+                    else json.dumps(raw_arguments, separators=(",", ":"))
+                )
+            else:
+                arguments = str(item.get("arguments") or "{}")
+            tool_call = {
+                "id": str(item.get("call_id") or item.get("id") or _new_api_id("call")),
+                "type": "function",
+                "function": {
+                    "name": _mapped_chat_tool_name(name, namespace, name_map, kind),
+                    "arguments": arguments,
+                },
+            }
+            _append_chat_tool_call(messages, tool_call)
+        elif item_type in {"function_call_output", "custom_tool_call_output", "tool_search_output"}:
+            output = (
+                item.get("tools", item.get("output"))
+                if item_type == "tool_search_output"
+                else item.get("output")
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(item.get("call_id") or item.get("id") or ""),
+                    "content": _tool_output_to_text(output),
+                }
+            )
+
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    return (
+        ChatRequest(
+            model=request.model,
+            messages=messages,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_tokens=request.max_output_tokens if request.max_output_tokens is not None else 4096,
+            stream=request.stream,
+            user=request.user or request.safety_identifier,
+            tools=chat_tools,
+            tool_choice=_responses_tool_choice_to_chat(request.tool_choice, name_map),
+            parallel_tool_calls=request.parallel_tool_calls,
+        ),
+        name_map,
+    )
+
+
+def _responses_usage(chat_usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not chat_usage:
+        return None
+    input_details = chat_usage.get("prompt_tokens_details") or {}
+    output_details = chat_usage.get("completion_tokens_details") or {}
+    return {
+        "input_tokens": int(chat_usage.get("prompt_tokens") or 0),
+        "input_tokens_details": {
+            "cached_tokens": int(input_details.get("cached_tokens") or chat_usage.get("cache_read_input_tokens") or 0),
+            "cache_write_tokens": int(chat_usage.get("cache_creation_input_tokens") or 0),
+        },
+        "output_tokens": int(chat_usage.get("completion_tokens") or 0),
+        "output_tokens_details": {
+            "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
+        },
+        "total_tokens": int(chat_usage.get("total_tokens") or 0),
+    }
+
+
+def _response_object(
+    request: ResponsesRequest,
+    response_id: str,
+    created_at: int,
+    model: str,
+    status: str,
+    output: List[Dict[str, Any]],
+    usage: Optional[Dict[str, Any]],
+    *,
+    error: Optional[Dict[str, Any]] = None,
+    incomplete_details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "error": error,
+        "incomplete_details": incomplete_details,
+        "instructions": None,
+        "max_output_tokens": request.max_output_tokens,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": request.parallel_tool_calls if request.parallel_tool_calls is not None else True,
+        "previous_response_id": request.previous_response_id,
+        "reasoning": request.reasoning or {"effort": None, "summary": None},
+        "store": bool(request.store),
+        "temperature": request.temperature,
+        "text": request.text or {"format": {"type": "text"}},
+        "tool_choice": request.tool_choice or "auto",
+        "tools": [],
+        "top_p": request.top_p,
+        "truncation": request.truncation or "disabled",
+        "usage": usage,
+        "user": request.user,
+        "metadata": request.metadata or {},
+    }
+
+
+def _decode_tool_name(chat_name: str, name_map: ToolNameMap) -> Tuple[str, Optional[str], str]:
+    return name_map.get(chat_name, ("function", None, chat_name))
+
+
+def _custom_input_from_chat_arguments(arguments: str) -> str:
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments
+    if isinstance(parsed, dict) and "input" in parsed:
+        value = parsed["input"]
+        return value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+    return arguments
+
+
+def _tool_search_arguments(arguments: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {"query": arguments}
+    return parsed if isinstance(parsed, dict) else {"query": str(parsed)}
+
+
+def _chat_tool_call_to_response_item(
+    tool_call: Dict[str, Any],
+    name_map: ToolNameMap,
+) -> Dict[str, Any]:
+    function = tool_call.get("function") or {}
+    kind, namespace, name = _decode_tool_name(str(function.get("name") or "tool"), name_map)
+    call_id = str(tool_call.get("id") or _new_api_id("call"))
+    arguments = str(function.get("arguments") or "{}")
+    if kind == "custom":
+        item = {
+            "id": _new_api_id("ctc"),
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": _custom_input_from_chat_arguments(arguments),
+        }
+    elif kind == "tool_search":
+        item = {
+            "id": _new_api_id("tsc"),
+            "type": "tool_search_call",
+            "status": "completed",
+            "call_id": call_id,
+            "execution": "client",
+            "arguments": _tool_search_arguments(arguments),
+        }
+    else:
+        item = {
+            "id": _new_api_id("fc"),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def chat_response_to_responses(
+    result: Dict[str, Any],
+    request: ResponsesRequest,
+    name_map: ToolNameMap,
+    *,
+    strip_model_prefix: bool = False,
+) -> Dict[str, Any]:
+    choice = (result.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output: List[Dict[str, Any]] = []
+    content = message.get("content")
+    if content:
+        text = str(content)
+        if strip_model_prefix:
+            text = re.sub(r"^\[[\w\-.]+\]\s*", "", text)
+        output.append(
+            {
+                "id": _new_api_id("msg"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
+                ],
+            }
+        )
+    for tool_call in message.get("tool_calls") or []:
+        output.append(_chat_tool_call_to_response_item(tool_call, name_map))
+
+    finish_reason = choice.get("finish_reason")
+    incomplete = finish_reason in {"length", "content_filter"}
+    status = "incomplete" if incomplete else "completed"
+    return _response_object(
+        request,
+        _new_api_id("resp"),
+        int(time.time()),
+        str(result.get("model") or request.model),
+        status,
+        output,
+        _responses_usage(result.get("usage")),
+        incomplete_details={"reason": "max_output_tokens"} if finish_reason == "length" else None,
+    )
+
+
+def _responses_sse(event: Dict[str, Any]) -> str:
+    return f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+
+
+async def _chat_sse_payloads(body_iterator: AsyncIterator[Any]) -> AsyncGenerator:
+    buffer = ""
+    async for raw_chunk in body_iterator:
+        if isinstance(raw_chunk, bytes):
+            raw_chunk = raw_chunk.decode("utf-8", errors="replace")
+        buffer += str(raw_chunk)
+        while "\n\n" in buffer:
+            block, buffer = buffer.split("\n\n", 1)
+            data_lines = [line[5:].lstrip() for line in block.splitlines() if line.startswith("data:")]
+            if not data_lines:
+                continue
+            data = "\n".join(data_lines)
+            if data == "[DONE]":
+                yield None
+            else:
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+    if buffer.strip():
+        data_lines = [line[5:].lstrip() for line in buffer.splitlines() if line.startswith("data:")]
+        if data_lines:
+            data = "\n".join(data_lines)
+            if data == "[DONE]":
+                yield None
+            else:
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    return
+
+
+async def chat_stream_to_responses(
+    body_iterator: AsyncIterator[Any],
+    request: ResponsesRequest,
+    name_map: ToolNameMap,
+    *,
+    strip_model_prefix: bool = False,
+) -> AsyncGenerator[str, None]:
+    """Translate Chat Completions SSE chunks into Responses API SSE events."""
+    response_id = _new_api_id("resp")
+    created_at = int(time.time())
+    model = request.model
+    sequence = 0
+    next_output_index = 0
+    finish_reason: Optional[str] = None
+    chat_usage: Optional[Dict[str, Any]] = None
+    final_output: List[Tuple[int, Dict[str, Any]]] = []
+
+    text_state: Optional[Dict[str, Any]] = None
+    tool_states: Dict[int, Dict[str, Any]] = {}
+    first_text_delta = True
+
+    def event(event_type: str, **fields: Any) -> Dict[str, Any]:
+        nonlocal sequence
+        value = {"type": event_type, **fields, "sequence_number": sequence}
+        sequence += 1
+        return value
+
+    def start_text_item() -> List[Dict[str, Any]]:
+        nonlocal text_state, next_output_index
+        if text_state is not None:
+            return []
+        text_state = {
+            "id": _new_api_id("msg"),
+            "output_index": next_output_index,
+            "text": "",
+            "done": False,
+        }
+        next_output_index += 1
+        item = {
+            "id": text_state["id"],
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
+        return [
+            event(
+                "response.output_item.added",
+                output_index=text_state["output_index"],
+                item=item,
+            ),
+            event(
+                "response.content_part.added",
+                item_id=text_state["id"],
+                output_index=text_state["output_index"],
+                content_index=0,
+                part=part,
+            ),
+        ]
+
+    def finish_text_item() -> List[Dict[str, Any]]:
+        if text_state is None or text_state["done"]:
+            return []
+        text_state["done"] = True
+        part = {
+            "type": "output_text",
+            "text": text_state["text"],
+            "annotations": [],
+            "logprobs": [],
+        }
+        item = {
+            "id": text_state["id"],
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [part],
+        }
+        final_output.append((text_state["output_index"], item))
+        return [
+            event(
+                "response.output_text.done",
+                item_id=text_state["id"],
+                output_index=text_state["output_index"],
+                content_index=0,
+                text=text_state["text"],
+                logprobs=[],
+            ),
+            event(
+                "response.content_part.done",
+                item_id=text_state["id"],
+                output_index=text_state["output_index"],
+                content_index=0,
+                part=part,
+            ),
+            event(
+                "response.output_item.done",
+                output_index=text_state["output_index"],
+                item=item,
+            ),
+        ]
+
+    def start_tool_item(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        nonlocal next_output_index
+        if state.get("started"):
+            return []
+        kind, namespace, name = _decode_tool_name(state.get("chat_name") or "tool", name_map)
+        state.update(
+            {
+                "started": True,
+                "kind": kind,
+                "namespace": namespace,
+                "name": name,
+                "item_id": _new_api_id(
+                    "ctc" if kind == "custom" else "tsc" if kind == "tool_search" else "fc"
+                ),
+                "output_index": next_output_index,
+            }
+        )
+        next_output_index += 1
+        if kind == "custom":
+            item: Dict[str, Any] = {
+                "id": state["item_id"],
+                "type": "custom_tool_call",
+                "status": "in_progress",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "input": "",
+            }
+        elif kind == "tool_search":
+            item = {
+                "id": state["item_id"],
+                "type": "tool_search_call",
+                "status": "in_progress",
+                "call_id": state["call_id"],
+                "execution": "client",
+                "arguments": {},
+            }
+        else:
+            item = {
+                "id": state["item_id"],
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "arguments": "",
+            }
+        if state["namespace"]:
+            item["namespace"] = state["namespace"]
+        return [
+            event(
+                "response.output_item.added",
+                output_index=state["output_index"],
+                item=item,
+            )
+        ]
+
+    def finish_tool_item(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not state.get("started") or state.get("done"):
+            return []
+        state["done"] = True
+        kind = state.get("kind", "function")
+        if kind == "custom":
+            custom_input = _custom_input_from_chat_arguments(state["arguments"])
+            item: Dict[str, Any] = {
+                "id": state["item_id"],
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "input": custom_input,
+            }
+            done_events = []
+            if custom_input:
+                done_events.append(
+                    event(
+                        "response.custom_tool_call_input.delta",
+                        item_id=state["item_id"],
+                        output_index=state["output_index"],
+                        delta=custom_input,
+                    )
+                )
+            done_events.append(
+                event(
+                    "response.custom_tool_call_input.done",
+                    item_id=state["item_id"],
+                    output_index=state["output_index"],
+                    input=custom_input,
+                )
+            )
+        elif kind == "tool_search":
+            item = {
+                "id": state["item_id"],
+                "type": "tool_search_call",
+                "status": "completed",
+                "call_id": state["call_id"],
+                "execution": "client",
+                "arguments": _tool_search_arguments(state["arguments"]),
+            }
+            done_events = []
+        else:
+            item = {
+                "id": state["item_id"],
+                "type": "function_call",
+                "status": "completed",
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "arguments": state["arguments"],
+            }
+            done_events = [
+                event(
+                    "response.function_call_arguments.done",
+                    item_id=state["item_id"],
+                    output_index=state["output_index"],
+                    arguments=state["arguments"],
+                )
+            ]
+        if state.get("namespace"):
+            item["namespace"] = state["namespace"]
+        final_output.append((state["output_index"], item))
+        return done_events + [
+            event(
+                "response.output_item.done",
+                output_index=state["output_index"],
+                item=item,
+            ),
+        ]
+
+    initial_response = _response_object(
+        request,
+        response_id,
+        created_at,
+        model,
+        "in_progress",
+        [],
+        None,
+    )
+    yield _responses_sse(event("response.created", response=initial_response))
+    yield _responses_sse(event("response.in_progress", response=initial_response))
+
+    async for payload in _chat_sse_payloads(body_iterator):
+        if payload is None:
+            # Drain the wrapped Chat stream so its HTTP context and async
+            # generator close cleanly before the Responses stream completes.
+            continue
+        if payload.get("error"):
+            error_value = payload["error"]
+            error_message = error_value.get("message") if isinstance(error_value, dict) else str(error_value)
+            failed_response = _response_object(
+                request,
+                response_id,
+                created_at,
+                model,
+                "failed",
+                [item for _, item in sorted(final_output)],
+                _responses_usage(chat_usage),
+                error={"code": "upstream_error", "message": error_message or "Upstream model failed"},
+            )
+            yield _responses_sse(event("response.failed", response=failed_response))
+            return
+
+        if payload.get("model"):
+            model = str(payload["model"])
+        if payload.get("usage"):
+            chat_usage = payload["usage"]
+
+        for choice in payload.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content is not None:
+                content = str(content)
+                if first_text_delta and strip_model_prefix:
+                    content = re.sub(r"^\[[\w\-.]+\]\s*", "", content)
+                if content:
+                    first_text_delta = False
+                    for item_event in start_text_item():
+                        yield _responses_sse(item_event)
+                    assert text_state is not None
+                    text_state["text"] += content
+                    yield _responses_sse(
+                        event(
+                            "response.output_text.delta",
+                            item_id=text_state["id"],
+                            output_index=text_state["output_index"],
+                            content_index=0,
+                            delta=content,
+                            logprobs=[],
+                        )
+                    )
+
+            streamed_tool_calls = list(delta.get("tool_calls") or [])
+            if delta.get("function_call"):
+                streamed_tool_calls.append(
+                    {
+                        "index": 0,
+                        "id": delta.get("id"),
+                        "type": "function",
+                        "function": delta["function_call"],
+                    }
+                )
+
+            for tool_call in streamed_tool_calls:
+                tool_index = int(tool_call.get("index") or 0)
+                state = tool_states.setdefault(
+                    tool_index,
+                    {
+                        "call_id": str(tool_call.get("id") or _new_api_id("call")),
+                        "chat_name": "",
+                        "arguments": "",
+                        "started": False,
+                        "done": False,
+                    },
+                )
+                if tool_call.get("id"):
+                    state["call_id"] = str(tool_call["id"])
+                function = tool_call.get("function") or {}
+                name_delta = function.get("name")
+                if name_delta:
+                    state["chat_name"] += str(name_delta)
+                arguments_delta = str(function.get("arguments") or "")
+                had_started = bool(state.get("started"))
+                state["arguments"] += arguments_delta
+
+                # Function names may themselves be split across Chat SSE chunks.
+                # The first argument fragment marks the point at which providers
+                # have finished emitting the name; calls with no arguments start
+                # in the finalization loop below.
+                if state["chat_name"] and arguments_delta and not state["started"]:
+                    for item_event in start_tool_item(state):
+                        yield _responses_sse(item_event)
+                if state["started"] and state.get("kind") == "function":
+                    emitted_arguments = arguments_delta if had_started else state["arguments"]
+                    if emitted_arguments:
+                        yield _responses_sse(
+                            event(
+                                "response.function_call_arguments.delta",
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                delta=emitted_arguments,
+                            )
+                        )
+
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+
+    for item_event in finish_text_item():
+        yield _responses_sse(item_event)
+    for _, state in sorted(tool_states.items()):
+        if state.get("chat_name") and not state.get("started"):
+            for item_event in start_tool_item(state):
+                yield _responses_sse(item_event)
+        for item_event in finish_tool_item(state):
+            yield _responses_sse(item_event)
+
+    output = [item for _, item in sorted(final_output, key=lambda pair: pair[0])]
+    is_incomplete = finish_reason in {"length", "content_filter"}
+    status = "incomplete" if is_incomplete else "completed"
+    completed_response = _response_object(
+        request,
+        response_id,
+        created_at,
+        model,
+        status,
+        output,
+        _responses_usage(chat_usage),
+        incomplete_details={"reason": "max_output_tokens"} if finish_reason == "length" else None,
+    )
+    event_type = "response.incomplete" if is_incomplete else "response.completed"
+    yield _responses_sse(event(event_type, response=completed_response))
+
+
+# ============================================================
 # LLM Backend
 # ============================================================
 
@@ -342,7 +1422,9 @@ class LLMBackend:
                    temperature: Optional[float] = None, stream: bool = False,
                    tools: Optional[List[Dict[str, Any]]] = None,
                    tool_choice: Optional[Any] = None,
-                   stream_options: Optional[Dict[str, Any]] = None):
+                   stream_options: Optional[Dict[str, Any]] = None,
+                   parallel_tool_calls: Optional[bool] = None,
+                   top_p: Optional[float] = None):
         """Call LLM API"""
         if llm_name not in self.config.llms:
             raise HTTPException(status_code=404, detail=f"LLM '{llm_name}' not found")
@@ -360,17 +1442,31 @@ class LLMBackend:
                 tools,
                 tool_choice,
                 stream_options,
+                parallel_tool_calls,
+                top_p,
             )
         else:
-            return await self._call_sync(llm_config, messages, max_tokens, temperature, api_key, tools, tool_choice)
+            return await self._call_sync(
+                llm_config,
+                messages,
+                max_tokens,
+                temperature,
+                api_key,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                top_p,
+            )
 
     async def _call_sync(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
                          temperature: Optional[float], api_key: Optional[str],
                          tools: Optional[List[Dict[str, Any]]] = None,
-                         tool_choice: Optional[Any] = None) -> Dict:
+                         tool_choice: Optional[Any] = None,
+                         parallel_tool_calls: Optional[bool] = None,
+                         top_p: Optional[float] = None) -> Dict:
         """Synchronous API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
+        adjusted_max = adjust_max_tokens(normalized, llm, max_tokens, tools)
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -387,10 +1483,14 @@ class LLMBackend:
             }
             if temperature is not None:
                 body["temperature"] = temperature
+            if top_p is not None:
+                body["top_p"] = top_p
             if tools is not None:
                 body["tools"] = tools
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                body["parallel_tool_calls"] = parallel_tool_calls
 
             resp = await client.post(
                 chat_url,
@@ -402,17 +1502,20 @@ class LLMBackend:
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
 
-            result = resp.json()
-            return clean_response(result)
+            result = clean_response(resp.json())
+            _log_usage_cost(llm, result.get("usage"))
+            return result
 
     async def _call_streaming(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
                           temperature: Optional[float], api_key: Optional[str],
                           tools: Optional[List[Dict[str, Any]]] = None,
                           tool_choice: Optional[Any] = None,
-                          stream_options: Optional[Dict[str, Any]] = None) -> AsyncGenerator:
+                          stream_options: Optional[Dict[str, Any]] = None,
+                          parallel_tool_calls: Optional[bool] = None,
+                          top_p: Optional[float] = None) -> AsyncGenerator:
         """Streaming API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
+        adjusted_max = adjust_max_tokens(normalized, llm, max_tokens, tools)
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -430,10 +1533,14 @@ class LLMBackend:
             }
             if temperature is not None:
                 body["temperature"] = temperature
+            if top_p is not None:
+                body["top_p"] = top_p
             if tools is not None:
                 body["tools"] = tools
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice
+            if parallel_tool_calls is not None:
+                body["parallel_tool_calls"] = parallel_tool_calls
 
             async with client.stream(
                 "POST",
@@ -446,8 +1553,20 @@ class LLMBackend:
                     error = await resp.aread()
                     raise HTTPException(status_code=resp.status_code, detail=error.decode()[:200])
 
+                latest_usage: Optional[Dict[str, Any]] = None
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
+                        payload = line[6:].strip()
+                        if payload == "[DONE]":
+                            _log_usage_cost(llm, latest_usage)
+                        elif payload:
+                            try:
+                                event = json.loads(payload)
+                                usage = event.get("usage")
+                                if isinstance(usage, dict) and usage:
+                                    latest_usage = usage
+                            except json.JSONDecodeError:
+                                pass
                         yield line + "\n\n"
 
 
@@ -471,6 +1590,11 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     # Initialize components
     router = OpenClawRouter(config)
     backend = LLMBackend(config)
+    # Codex can make several model requests for one user turn while executing
+    # tools. Keep the selected backend stable for that loop, but allow the next
+    # distinct user query in the same thread to be routed again.
+    codex_route_cache: OrderedDict[Tuple[str, str, str, str], str] = OrderedDict()
+    codex_route_cache_limit = 1024
 
     @app.get("/health")
     async def health():
@@ -490,8 +1614,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             ] + [{"id": "auto", "object": "model", "description": "Auto router"}]
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatRequest):
+    async def _serve_chat_completions(
+        request: ChatRequest,
+        codex_cache_context: Optional[Tuple[str, str, str]] = None,
+    ):
         print(f"============\n")
         messages = []
         for message in request.messages:
@@ -542,19 +1668,65 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         if not user_query:
             user_query = "general query"
 
-        # Select model
+        # Constrain routing and fallback to models that can fit this request.
         available_models = list(config.llms.keys())
+        eligible_models, estimated_input_tokens = _eligible_models_for_request(
+            config,
+            messages,
+            request.tools,
+        )
+        if not eligible_models:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Input requires approximately {estimated_input_tokens} tokens; "
+                    "no configured model has enough context."
+                ),
+            )
+
         if request.model == "auto" or request.model not in available_models:
-            selected_model = await router.select_model(user_query, user=request.user)
-            # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
-            # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
-            print(f"[Router] Query: '{user_query}' -> {selected_model}")
+            selected_model = None
+            cache_key = None
+            if codex_cache_context is not None:
+                identity, prompt_cache_key, advertised_model = codex_cache_context
+                query_digest = hashlib.sha256(user_query.encode("utf-8")).hexdigest()
+                cache_key = (identity, advertised_model, prompt_cache_key, query_digest)
+                cached_model = codex_route_cache.get(cache_key)
+                if cached_model in eligible_models:
+                    selected_model = cached_model
+                    codex_route_cache.move_to_end(cache_key)
+                    print(f"[Router] Reusing Codex turn route -> {selected_model}")
+
+            if selected_model is None:
+                selected_model = await router.select_model(
+                    user_query,
+                    user=request.user,
+                    candidate_models=eligible_models,
+                )
+                if cache_key is not None:
+                    codex_route_cache[cache_key] = selected_model
+                    codex_route_cache.move_to_end(cache_key)
+                    while len(codex_route_cache) > codex_route_cache_limit:
+                        codex_route_cache.popitem(last=False)
+                    print(f"[Router] Codex query: '{user_query}' -> {selected_model}")
+                else:
+                    print(f"[Router] Query: '{user_query}' -> {selected_model}")
         else:
+            if request.model not in eligible_models:
+                context_limit = _configured_context_limit(config.llms[request.model])
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Input requires approximately {estimated_input_tokens} tokens, "
+                        f"which exceeds the configured context limit for "
+                        f"'{request.model}' ({context_limit})."
+                    ),
+                )
             selected_model = request.model
             print(f"[Specified] Query: '{user_query}' -> {selected_model}")
 
         fallback_chain = _build_fallback_chain(
-            selected_model, available_models, config.router.fallback_models
+            selected_model, eligible_models, config.router.fallback_models
         )
 
         # Handle streaming
@@ -598,6 +1770,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                                 tools=request.tools,
                                 tool_choice=request.tool_choice,
                                 stream_options=request.stream_options,
+                                parallel_tool_calls=request.parallel_tool_calls,
+                                top_p=request.top_p,
                             )
                             # Probe the connection before committing to this
                             # candidate, so a failed attempt never reaches the
@@ -723,7 +1897,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     result = await backend.call(
                         candidate, messages, request.max_tokens,
                         request.temperature, stream=False,
-                        tools=request.tools, tool_choice=request.tool_choice
+                        tools=request.tools,
+                        tool_choice=request.tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        top_p=request.top_p,
                     )
                     selected_model = candidate
                     if i > 0:
@@ -748,6 +1925,56 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             result["model"] = selected_model
             return result
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: ChatRequest):
+        return await _serve_chat_completions(request)
+
+    @app.post("/v1/responses")
+    async def responses(request: ResponsesRequest):
+        """Codex-compatible Responses API adapter.
+
+        Routing and upstream retries stay on the existing Chat Completions path;
+        this endpoint only translates request, tool, response, and SSE shapes.
+        """
+        chat_request, tool_name_map = responses_request_to_chat(request)
+
+        available_models = list(config.llms.keys())
+        should_route = request.model == "auto" or request.model not in available_models
+        cache_context = None
+        if should_route and request.prompt_cache_key:
+            identity = request.user or request.safety_identifier or "anonymous"
+            cache_context = (identity, request.prompt_cache_key, request.model)
+
+        result = await _serve_chat_completions(chat_request, cache_context)
+
+        if request.stream:
+            if not isinstance(result, StreamingResponse):
+                raise HTTPException(status_code=500, detail="Expected a streaming upstream response")
+            return StreamingResponse(
+                chat_stream_to_responses(
+                    result.body_iterator,
+                    request,
+                    tool_name_map,
+                    strip_model_prefix=config.show_model_prefix,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=500, detail="Expected a JSON upstream response")
+        return chat_response_to_responses(
+            result,
+            request,
+            tool_name_map,
+            strip_model_prefix=config.show_model_prefix,
+        )
+
+    @app.post("/v1/analytics/codex/turn-costs", status_code=204)
+    async def codex_turn_costs():
+        """Accept optional Codex cost telemetry without persisting it."""
+        return Response(status_code=204)
+
     @app.get("/")
     async def root():
         return {
@@ -757,6 +1984,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             "llms": list(config.llms.keys()),
             "endpoints": {
                 "chat": "POST /v1/chat/completions",
+                "responses": "POST /v1/responses",
                 "models": "GET /v1/models",
                 "health": "GET /health"
             }
@@ -805,10 +2033,32 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
             # Select model
             available_models = list(config.llms.keys())
+            eligible_models, estimated_input_tokens = _eligible_models_for_request(
+                config,
+                messages,
+                request.tools,
+            )
+            if not eligible_models:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Input requires approximately {estimated_input_tokens} tokens; "
+                        "no configured model has enough context."
+                    ),
+                )
             if request.model == "auto" or request.model not in available_models:
-                selected_model = await router.select_model(user_query, user=request.user)
+                selected_model = await router.select_model(
+                    user_query,
+                    user=request.user,
+                    candidate_models=eligible_models,
+                )
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
             else:
+                if request.model not in eligible_models:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Input exceeds the configured context limit for '{request.model}'.",
+                    )
                 selected_model = request.model
 
             # Call LLM backend in streaming mode
@@ -821,6 +2071,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 request.temperature,
                 stream=True,
                 stream_options=request.stream_options,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                top_p=request.top_p,
             )
 
             async for chunk in stream_gen:
@@ -915,7 +2169,8 @@ def run_server(app: FastAPI = None, config_path: str = None, host: str = "0.0.0.
   OpenClaw Router
 ============================================================
   Server: http://{host}:{port}
-  API:    http://{host}:{port}/v1/chat/completions
+  Chat:   http://{host}:{port}/v1/chat/completions
+  Codex:  http://{host}:{port}/v1/responses
   Health: http://{host}:{port}/health
 ============================================================
 """)

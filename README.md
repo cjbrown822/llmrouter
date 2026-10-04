@@ -778,9 +778,11 @@ Automix) are available behind `--include-api-routers`. See
 
 | Feature | Benefit |
 |---------|---------|
-| **OpenAI-Compatible API** | Drop-in replacement for any OpenAI client (`/v1/chat/completions`) |
+| **OpenAI-Compatible APIs** | Chat Completions clients (`/v1/chat/completions`) plus Codex custom providers (`/v1/responses`) |
+| **Codex Tool Loop** | Translates Responses function, namespace, custom (`apply_patch`), and deferred tool-search calls end to end |
 | **All Routing Strategies** | Use any of the 16+ LLMRouter strategies (KNN, SVM, MLP, LLM-based, etc.) |
 | **Multimodal Understanding** | Process images, audio, and video - convert to text for routing decisions |
+| **Runtime Constraints** | Honor per-model context/output limits and emit token-based cost accounting from configured prices |
 | **Routing Memory** | Persist query→model history; retrieve similar past routes for better decisions |
 | **Streaming Support** | Full streaming responses with optional `[model_name]` prefix |
 | **Multi-Provider** | Route to Together AI, NVIDIA, OpenAI, Anthropic, or local models |
@@ -880,7 +882,7 @@ media:
 
 ### Documentation
 
-For complete setup instructions including Slack/Discord integration:
+For complete setup instructions including Codex and Slack/Discord integration:
 - 📖 **Full Guide**: [openclaw_router/README.md](openclaw_router/README.md)
 
 

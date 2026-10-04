@@ -31,6 +31,7 @@ api_keys:
   together: "Your-Together-API-Key"
 
 # LLM Backend Configuration (Together-hosted models)
+# input_price/output_price are USD per one million tokens.
 llms:
   llama-3.1-8b:
     description: "Fast general chat"

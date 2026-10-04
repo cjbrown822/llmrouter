@@ -42,6 +42,8 @@ class LLMConfig:
     api_key: Optional[str] = None
     api_key_env: Optional[str] = None
     description: str = ""
+    # Prices are USD per one million tokens. They are used for runtime usage
+    # accounting and may also inform cost-aware routing configurations.
     input_price: float = 0.0
     output_price: float = 0.0
     max_tokens: int = 4096

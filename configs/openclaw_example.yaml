@@ -97,6 +97,7 @@ memory:
 # ============================================================
 # LLM Backend Configuration
 # ============================================================
+# input_price/output_price are USD per one million tokens.
 llms:
   # Fast models
   llama-3.1-8b:
