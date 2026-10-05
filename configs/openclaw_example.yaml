@@ -8,7 +8,8 @@
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true  # Add [model_name] prefix to responses
+  show_model_prefix: false
+  show_model_suffix: true  # Append [model: upstream/model-id] to final text answers
 
 # ============================================================
 # Router Strategy Configuration

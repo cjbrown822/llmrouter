@@ -812,7 +812,8 @@ Automix) are available behind `--include-api-routers`. See
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true  # Append [model: upstream/model-id] to final text answers
 
 router:
   strategy: llm  # or: random, round_robin, rules, llmrouter

@@ -137,6 +137,8 @@ codex
 
 The Responses adapter supports streaming text, function and namespace tools, custom tools such as `apply_patch`, deferred tool search, parallel tool-call forwarding, supported image/audio preprocessing, and every corresponding tool output. Common generation settings such as `temperature`, `top_p`, and output limits are forwarded. Routing and fallback automatically exclude backends whose configured context window cannot fit the request. Backend models still need reliable tool-calling support for agentic Codex tasks.
 
+To identify the actual backend selected by the router, enable `serve.show_model_suffix`. Final text answers end with `[model: <configured upstream model id>]`; tool-call turns remain unchanged so the client tool loop stays machine-readable. When both suffix and legacy prefix settings are enabled, the suffix takes precedence.
+
 To repeat the full local transport/tool-loop smoke test without API keys:
 
 ```bash
@@ -161,7 +163,8 @@ Example: Together (OpenAI-compatible)
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 router:
   strategy: llm
@@ -358,7 +361,8 @@ Minimal shape:
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 router:
   strategy: random   # random | round_robin | rules | llm | llmrouter
@@ -382,6 +386,7 @@ llms:
 
 Key fields:
 - `serve.host` / `serve.port`: where OpenClaw Router listens.
+- `serve.show_model_suffix`: append `[model: <upstream model id>]` to completed text answers. It is omitted on tool-call turns and takes precedence over `show_model_prefix`.
 - `router.strategy`:
   - `random` / `round_robin` / `rules`: deterministic/simple routing.
   - `llm`: uses a "router LLM" to pick the backend model.
@@ -586,7 +591,7 @@ This is the recommended entry point for Slack: it starts both OpenClaw Router an
 | `-r, --router NAME` | Router name or built-in strategy (e.g. `random`, `llm`, `knnrouter`) |
 | `--router-config FILE` | Router-specific config file path (optional; auto-detected if omitted) |
 | `--no-gateway` | Don't start OpenClaw Gateway |
-| `--no-prefix` | Don't add model name prefix to responses |
+| `--no-prefix` | Disable model prefix and suffix attribution in responses |
 | `--list-routers` | List available original LLMRouter routers |
 | `-h, --help` | Show help message |
 

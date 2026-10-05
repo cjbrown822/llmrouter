@@ -150,6 +150,7 @@ class OpenClawConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     show_model_prefix: bool = True
+    show_model_suffix: bool = False
 
     # Router settings
     router: RouterConfig = field(default_factory=RouterConfig)
@@ -195,6 +196,7 @@ class OpenClawConfig:
         config.host = serve_config.get("host", config.host)
         config.port = serve_config.get("port", config.port)
         config.show_model_prefix = serve_config.get("show_model_prefix", config.show_model_prefix)
+        config.show_model_suffix = serve_config.get("show_model_suffix", config.show_model_suffix)
 
         # API Keys
         config.api_keys = data.get("api_keys", {})

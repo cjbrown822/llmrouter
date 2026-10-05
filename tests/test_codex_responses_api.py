@@ -67,16 +67,21 @@ class RecordingAsyncClient:
         return MockStreamResponse(status_code=200, lines=type(self).stream_lines)
 
 
-def build_test_client(show_model_prefix=True):
+def build_test_client(
+    show_model_prefix=True,
+    show_model_suffix=False,
+    model_id="mock-model",
+):
     config = OpenClawConfig(
         show_model_prefix=show_model_prefix,
+        show_model_suffix=show_model_suffix,
         router=RouterConfig(strategy="random"),
         media=MediaConfig(enabled=False),
         llms={
             "mock-model": LLMConfig(
                 name="mock-model",
                 provider="mock",
-                model_id="mock-model",
+                model_id=model_id,
                 base_url="https://example.test/v1",
                 description="Mock model",
             )
@@ -249,6 +254,36 @@ class CodexResponsesApiTests(unittest.TestCase):
         self.assertEqual(body["usage"]["input_tokens"], 12)
         self.assertEqual(body["usage"]["input_tokens_details"]["cached_tokens"], 4)
         self.assertEqual(body["usage"]["output_tokens_details"]["reasoning_tokens"], 2)
+
+    def test_non_streaming_response_keeps_upstream_model_suffix(self):
+        RecordingAsyncClient.response_json = {
+            "id": "chatcmpl-response-suffix",
+            "object": "chat.completion",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Hello Codex"},
+                }
+            ],
+        }
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = build_test_client(
+                show_model_prefix=True,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            ).post(
+                "/v1/responses",
+                json={"model": "auto", "input": "Say hello", "stream": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["output"][0]["content"][0]["text"],
+            "Hello Codex\n\n[model: qwen/qwen3.5-9b]",
+        )
 
     def test_generation_limits_top_p_and_runtime_cost_use_model_config(self):
         RecordingAsyncClient.response_json = {
@@ -490,6 +525,60 @@ class CodexResponsesApiTests(unittest.TestCase):
         self.assertEqual(completed["usage"]["total_tokens"], 7)
         self.assertEqual(completed["output"][0]["content"][0]["text"], "Hello Codex")
 
+    def test_streaming_response_keeps_upstream_model_suffix(self):
+        content_chunk = {
+            "id": "chatcmpl-response-suffix-stream",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Hello Codex"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        stop_chunk = {
+            "id": "chatcmpl-response-suffix-stream",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        RecordingAsyncClient.stream_lines = [
+            f"data: {json.dumps(content_chunk)}",
+            f"data: {json.dumps(stop_chunk)}",
+            "data: [DONE]",
+        ]
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            client = build_test_client(
+                show_model_prefix=True,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            )
+            with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "auto", "input": "Say hello", "stream": True},
+            ) as response:
+                body = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200)
+        events = parse_sse(body)
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "response.output_text.delta"
+        ]
+        self.assertEqual(
+            deltas,
+            ["Hello Codex", "\n\n[model: qwen/qwen3.5-9b]"],
+        )
+        self.assertEqual(
+            events[-1]["response"]["output"][0]["content"][0]["text"],
+            "Hello Codex\n\n[model: qwen/qwen3.5-9b]",
+        )
+
     def test_custom_and_tool_search_calls_translate_in_both_directions(self):
         patch_text = "*** Begin Patch\n*** Add File: example.txt\n+ok\n*** End Patch"
         RecordingAsyncClient.response_json = {
@@ -676,9 +765,16 @@ class CodexResponsesApiTests(unittest.TestCase):
         }
 
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
-            client = build_test_client(show_model_prefix=True)
+            client = build_test_client(
+                show_model_prefix=True,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            )
             with client.stream("POST", "/v1/responses", json=first_payload) as response:
-                events = parse_sse("".join(response.iter_text()))
+                stream_body = "".join(response.iter_text())
+                events = parse_sse(stream_body)
+
+        self.assertNotIn("[model:", stream_body)
 
         added = next(
             event

@@ -5,7 +5,8 @@
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 # Routing Strategy
 # Options: random, round_robin, rules, llm, llmrouter

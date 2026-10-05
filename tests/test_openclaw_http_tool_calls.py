@@ -65,16 +65,21 @@ class RecordingAsyncClient:
         return MockStreamResponse(status_code=200, lines=type(self).stream_lines)
 
 
-def build_test_client(show_model_prefix=True):
+def build_test_client(
+    show_model_prefix=True,
+    show_model_suffix=False,
+    model_id="mock-model",
+):
     config = OpenClawConfig(
         show_model_prefix=show_model_prefix,
+        show_model_suffix=show_model_suffix,
         router=RouterConfig(strategy="random"),
         media=MediaConfig(enabled=False),
         llms={
             "mock-model": LLMConfig(
                 name="mock-model",
                 provider="mock",
-                model_id="mock-model",
+                model_id=model_id,
                 base_url="https://example.test/v1",
                 description="Mock model",
             )
@@ -85,6 +90,82 @@ def build_test_client(show_model_prefix=True):
 
 
 class OpenClawHttpToolCallTests(unittest.TestCase):
+    def test_chat_completions_appends_upstream_model_suffix_to_text_only_response(self):
+        RecordingAsyncClient.response_json = {
+            "id": "chatcmpl-suffix",
+            "object": "chat.completion",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Hello"},
+                }
+            ],
+        }
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = build_test_client(
+                show_model_prefix=True,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            ).post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "Say hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "Hello\n\n[model: qwen/qwen3.5-9b]",
+        )
+
+    def test_chat_completions_does_not_append_suffix_to_tool_call_turn(self):
+        RecordingAsyncClient.response_json = {
+            "id": "chatcmpl-suffix-tool",
+            "object": "chat.completion",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "I will call the tool.",
+                        "tool_calls": [
+                            {
+                                "id": "call_suffix",
+                                "type": "function",
+                                "function": {"name": "probe", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = build_test_client(
+                show_model_prefix=False,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            ).post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "Use the probe"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["message"]["content"],
+            "I will call the tool.",
+        )
+
     def test_chat_completions_preserves_tool_calls_and_forwards_tools(self):
         RecordingAsyncClient.response_json = {
             "id": "chatcmpl-1",
@@ -164,7 +245,18 @@ class OpenClawHttpToolCallTests(unittest.TestCase):
             },
         )
 
-    def test_chat_completions_streaming_tool_calls_skip_prefix_injection(self):
+    def test_chat_completions_streaming_tool_calls_skip_model_attribution(self):
+        preamble_chunk = {
+            "id": "chatcmpl-2",
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Checking now."},
+                    "finish_reason": None,
+                }
+            ],
+        }
         first_chunk = {
             "id": "chatcmpl-2",
             "object": "chat.completion.chunk",
@@ -202,6 +294,7 @@ class OpenClawHttpToolCallTests(unittest.TestCase):
         }
 
         RecordingAsyncClient.stream_lines = [
+            f"data: {json.dumps(preamble_chunk)}",
             f"data: {json.dumps(first_chunk)}",
             f"data: {json.dumps(second_chunk)}",
             "data: [DONE]",
@@ -228,14 +321,20 @@ class OpenClawHttpToolCallTests(unittest.TestCase):
         }
 
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
-            client = build_test_client(show_model_prefix=True)
+            client = build_test_client(
+                show_model_prefix=True,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            )
             with client.stream("POST", "/v1/chat/completions", json=payload) as response:
                 body = "".join(response.iter_text())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(RecordingAsyncClient.last_stream_json["tools"], payload["tools"])
+        self.assertIn("Checking now.", body)
         self.assertIn('"tool_calls"', body)
         self.assertNotIn("[mock-model]", body)
+        self.assertNotIn("[model:", body)
 
     def test_chat_completions_streaming_requests_usage_and_preserves_usage_chunk(self):
         content_chunk = {
@@ -292,6 +391,53 @@ class OpenClawHttpToolCallTests(unittest.TestCase):
         self.assertIn('"completion_tokens_details": {"reasoning_tokens": 6}', body)
         self.assertIn('"cache_read_input_tokens": 5', body)
         self.assertIn('"cache_creation_input_tokens": 2', body)
+
+    def test_chat_completions_streaming_appends_suffix_before_finish(self):
+        content_chunk = {
+            "id": "chatcmpl-suffix-stream",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Hello"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        finish_chunk = {
+            "id": "chatcmpl-suffix-stream",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        RecordingAsyncClient.stream_lines = [
+            f"data: {json.dumps(content_chunk)}",
+            f"data: {json.dumps(finish_chunk)}",
+            "data: [DONE]",
+        ]
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            client = build_test_client(
+                show_model_prefix=False,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            )
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model",
+                    "messages": [{"role": "user", "content": "Say hello"}],
+                    "stream": True,
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200)
+        suffix = "[model: qwen/qwen3.5-9b]"
+        self.assertEqual(body.count(suffix), 1)
+        self.assertLess(body.index(suffix), body.index('"finish_reason": "stop"'))
 
     def test_chat_completions_streaming_preserves_usage_chunk_with_prefix_buffering(self):
         buffered_content_chunk = {
@@ -376,6 +522,55 @@ class OpenClawHttpToolCallTests(unittest.TestCase):
 
         self.assertIn("[mock-model] short", first_message)
         self.assertEqual(second_message["usage"], {"prompt_tokens": 13, "completion_tokens": 2, "total_tokens": 15})
+        self.assertEqual(done_message, "data: [DONE]\n\n")
+
+    def test_chat_websocket_streaming_appends_model_suffix(self):
+        content_chunk = {
+            "id": "chatcmpl-ws-suffix",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Hello"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        finish_chunk = {
+            "id": "chatcmpl-ws-suffix",
+            "object": "chat.completion.chunk",
+            "model": "provider-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        RecordingAsyncClient.stream_lines = [
+            f"data: {json.dumps(content_chunk)}",
+            f"data: {json.dumps(finish_chunk)}",
+            "data: [DONE]",
+        ]
+
+        payload = {
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": True,
+        }
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            client = build_test_client(
+                show_model_prefix=False,
+                show_model_suffix=True,
+                model_id="qwen/qwen3.5-9b",
+            )
+            with client.websocket_connect("/v1/chat/ws") as websocket:
+                websocket.send_json(payload)
+                content_message = websocket.receive_text()
+                suffix_message = websocket.receive_text()
+                finish_message = websocket.receive_text()
+                done_message = websocket.receive_text()
+
+        self.assertIn('"content": "Hello"', content_message)
+        self.assertIn("[model: qwen/qwen3.5-9b]", suffix_message)
+        self.assertIn('"finish_reason": "stop"', finish_message)
         self.assertEqual(done_message, "data: [DONE]\n\n")
 
 

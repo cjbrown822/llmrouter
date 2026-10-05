@@ -287,6 +287,7 @@ def serve_command(args):
         config.router.llmrouter_config = args.router_config
     if args.no_prefix:
         config.show_model_prefix = False
+        config.show_model_suffix = False
 
     # Create and run app
     app = create_app(config=config)
@@ -614,7 +615,7 @@ OpenClaw Integration:
     serve_parser.add_argument(
         "--no-prefix",
         action="store_true",
-        help="Disable model name prefix in responses",
+        help="Disable model prefix and suffix attribution in responses",
     )
     serve_parser.set_defaults(func=serve_command)
 

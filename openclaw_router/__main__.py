@@ -38,7 +38,11 @@ Available Routers:
     parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind (default: 8000)")
     parser.add_argument("--router", "-r", help="LLMRouter name (e.g., knnrouter, randomrouter)")
     parser.add_argument("--router-config", help="Router config file path")
-    parser.add_argument("--no-prefix", action="store_true", help="Don't add model name prefix to responses")
+    parser.add_argument(
+        "--no-prefix",
+        action="store_true",
+        help="Disable model prefix and suffix attribution in responses",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -69,6 +73,7 @@ Available Routers:
 
     if args.no_prefix:
         config.show_model_prefix = False
+        config.show_model_suffix = False
 
     # Run server
     app = create_app(config=config)

@@ -306,6 +306,35 @@ def _delta_has_tool_calls(delta: Optional[Dict[str, Any]]) -> bool:
     return bool(delta and (delta.get("tool_calls") or delta.get("function_call")))
 
 
+def _model_attribution_suffix(config: OpenClawConfig, selected_model: str) -> str:
+    llm_config = config.llms.get(selected_model)
+    model_id = llm_config.model_id if llm_config and llm_config.model_id else selected_model
+    return f"\n\n[model: {model_id}]"
+
+
+def _model_suffix_stream_chunk(
+    template: Optional[Dict[str, Any]],
+    suffix: str,
+) -> str:
+    template = template or {}
+    source_choices = template.get("choices") or [{}]
+    payload = {
+        "id": template.get("id", ""),
+        "object": template.get("object", "chat.completion.chunk"),
+        "choices": [
+            {
+                "index": source_choices[0].get("index", 0),
+                "delta": {"content": suffix},
+                "finish_reason": None,
+            }
+        ],
+    }
+    for key in ("created", "model", "system_fingerprint"):
+        if key in template:
+            payload[key] = template[key]
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 def _clean_usage_value(value: Any) -> Any:
     if isinstance(value, dict):
         cleaned = {}
@@ -1736,6 +1765,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 prefix_sent = False
                 content_buffer = ""
                 buffered_chunks = []
+                suffix_sent = False
+                stream_saw_text = False
+                stream_saw_tool_calls = False
+                suffix_template: Optional[Dict[str, Any]] = None
 
                 def flush_buffered_prefix() -> Optional[str]:
                     nonlocal prefix_sent, content_buffer, buffered_chunks
@@ -1796,6 +1829,53 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
                     combined_stream = _prepend_chunk(first_chunk, stream_gen)
                     async for chunk in combined_stream:
+                        if config.show_model_suffix:
+                            if "[DONE]" in chunk:
+                                if stream_saw_text and not stream_saw_tool_calls and not suffix_sent:
+                                    yield _model_suffix_stream_chunk(
+                                        suffix_template,
+                                        _model_attribution_suffix(config, selected_model),
+                                    )
+                                    suffix_sent = True
+                                yield chunk
+                                continue
+
+                            try:
+                                json_str = chunk[6:] if chunk.startswith("data: ") else chunk
+                                data = json.loads(json_str.strip())
+                            except Exception:
+                                yield chunk
+                                continue
+
+                            choices = data.get("choices") or []
+                            if choices:
+                                suffix_template = data
+                            for choice in choices:
+                                delta = choice.get("delta") or {}
+                                if delta.get("content"):
+                                    stream_saw_text = True
+                                if _delta_has_tool_calls(delta) or choice.get("finish_reason") in {
+                                    "tool_calls",
+                                    "function_call",
+                                }:
+                                    stream_saw_tool_calls = True
+
+                            terminal_chunk = any(choice.get("finish_reason") for choice in choices)
+                            if (
+                                terminal_chunk
+                                and stream_saw_text
+                                and not stream_saw_tool_calls
+                                and not suffix_sent
+                            ):
+                                yield _model_suffix_stream_chunk(
+                                    suffix_template,
+                                    _model_attribution_suffix(config, selected_model),
+                                )
+                                suffix_sent = True
+
+                            yield chunk
+                            continue
+
                         if not config.show_model_prefix:
                             yield chunk
                             continue
@@ -1913,8 +1993,16 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             if result is None:
                 raise last_error
 
-            # Add model prefix
-            if config.show_model_prefix and result.get("choices"):
+            # Add model attribution only to completed text answers. Tool-call
+            # turns remain machine-readable for the client's tool loop.
+            if config.show_model_suffix and result.get("choices"):
+                message = result["choices"][0].get("message", {})
+                content = message.get("content")
+                if content and not _message_has_tool_calls(message):
+                    suffix = _model_attribution_suffix(config, selected_model)
+                    content = re.sub(r"\s*\[model:\s*[^\]\n]+\]\s*$", "", str(content))
+                    message["content"] = f"{content.rstrip()}{suffix}"
+            elif config.show_model_prefix and result.get("choices"):
                 message = result["choices"][0].get("message", {})
                 content = message.get("content")
                 if content and not _message_has_tool_calls(message):
@@ -1955,7 +2043,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     result.body_iterator,
                     request,
                     tool_name_map,
-                    strip_model_prefix=config.show_model_prefix,
+                    strip_model_prefix=config.show_model_prefix and not config.show_model_suffix,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1967,7 +2055,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             result,
             request,
             tool_name_map,
-            strip_model_prefix=config.show_model_prefix,
+            strip_model_prefix=config.show_model_prefix and not config.show_model_suffix,
         )
 
     @app.post("/v1/analytics/codex/turn-costs", status_code=204)
@@ -2065,6 +2153,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             prefix_sent = False
             content_buffer = ""
             buffered_chunks = []
+            suffix_sent = False
+            stream_saw_text = False
+            stream_saw_tool_calls = False
+            suffix_template: Optional[Dict[str, Any]] = None
 
             stream_gen = await backend.call(
                 selected_model, messages, request.max_tokens,
@@ -2078,6 +2170,57 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             )
 
             async for chunk in stream_gen:
+                if config.show_model_suffix:
+                    if "[DONE]" in chunk:
+                        if stream_saw_text and not stream_saw_tool_calls and not suffix_sent:
+                            await websocket.send_text(
+                                _model_suffix_stream_chunk(
+                                    suffix_template,
+                                    _model_attribution_suffix(config, selected_model),
+                                )
+                            )
+                            suffix_sent = True
+                        await websocket.send_text(chunk)
+                        continue
+
+                    try:
+                        json_str = chunk[6:] if chunk.startswith("data: ") else chunk
+                        data_chunk = json.loads(json_str.strip())
+                    except Exception:
+                        await websocket.send_text(chunk)
+                        continue
+
+                    choices = data_chunk.get("choices") or []
+                    if choices:
+                        suffix_template = data_chunk
+                    for choice in choices:
+                        delta = choice.get("delta") or {}
+                        if delta.get("content"):
+                            stream_saw_text = True
+                        if _delta_has_tool_calls(delta) or choice.get("finish_reason") in {
+                            "tool_calls",
+                            "function_call",
+                        }:
+                            stream_saw_tool_calls = True
+
+                    terminal_chunk = any(choice.get("finish_reason") for choice in choices)
+                    if (
+                        terminal_chunk
+                        and stream_saw_text
+                        and not stream_saw_tool_calls
+                        and not suffix_sent
+                    ):
+                        await websocket.send_text(
+                            _model_suffix_stream_chunk(
+                                suffix_template,
+                                _model_attribution_suffix(config, selected_model),
+                            )
+                        )
+                        suffix_sent = True
+
+                    await websocket.send_text(chunk)
+                    continue
+
                 if not config.show_model_prefix:
                     await websocket.send_text(chunk)
                     continue
