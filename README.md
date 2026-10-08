@@ -645,6 +645,18 @@ llmrouter infer --router thresholdrouter \
   --query "Explain quantum computing"
 ```
 
+**RouteFMPluginRouter** - Pretrained frozen router that adapts from behavioral Context
+```bash
+pip install -e ".[routefm]"
+llmrouter infer --router routefm_router \
+  --config custom_routers/routefm_router/config.yaml \
+  --query "Prove that there are infinitely many primes." \
+  --route-only
+```
+
+See the [RouteFM adapter guide](custom_routers/routefm_router/README.md) and
+[paper](https://arxiv.org/abs/2609.37362).
+
 ### Documentation
 
 For detailed guides on creating custom routers:

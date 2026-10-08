@@ -58,6 +58,8 @@ classifiers = [
 [project.optional-dependencies]
 # RouterR1 requires vLLM (GPU only)
 router-r1 = ["vllm==0.6.3", "torch==2.4.0", "openai>=1.0"]
+# RouteFM is a frozen in-context router with a BGE text interface.
+routefm = ["routefm-router[bge]>=1.1,<2"]
 # All optional dependencies
 all = ["vllm==0.6.3", "torch==2.4.0", "openai>=1.0"]
 
