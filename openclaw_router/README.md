@@ -15,8 +15,9 @@ Pairing OpenClaw (channels + agents) with OpenClaw Router (OpenAI-compatible rou
 
 ## Features
 
-- OpenAI-compatible API: drop-in replacement for OpenAI-style clients (`/v1/chat/completions`).
+- OpenAI-compatible APIs: Chat Completions (`/v1/chat/completions`) and a Codex-compatible Responses adapter (`/v1/responses`).
 - HTTP tool calling pass-through: forwards OpenAI-compatible `tools` / `tool_choice` fields and preserves `tool_calls` in `/v1/chat/completions` responses. The Router does not execute tools itself.
+- Codex tool translation: converts Responses function and namespace tools to Chat Completions tools, then converts streamed tool calls and tool outputs back into Responses events.
 - Multiple routing strategies: built-in strategies plus the original LLMRouter ML-based routers.
 - Streaming support: end-to-end streaming responses.
 - Optional model prefix: add `[model_name]` to responses for debugging routing decisions.
@@ -107,6 +108,45 @@ You typically configure 2 files:
 
 Important: `~/.openclaw/openclaw.json` is a full OpenClaw config. You should edit/merge specific sections, not replace the whole file.
 
+## Codex Integration
+
+Codex custom model providers use the Responses API. Start this router normally, then add a user-level provider to `~/.codex/config.toml`:
+
+```toml
+# This is Codex's capability/tool envelope; the router still chooses the real
+# backend because this slug is not one of its configured LLM keys.
+model = "gpt-5.5"
+model_provider = "llmrouter"
+
+[model_providers.llmrouter]
+name = "LLMRouter"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+```
+
+Provider settings must be in the user-level file; Codex ignores `model_provider`, `model_providers`, and `openai_base_url` in project-local `.codex/config.toml` files. If the router is remote or protected, add `env_key = "LLMROUTER_API_KEY"` and export that environment variable before starting Codex.
+
+Use a Codex model profile that emits client-side tool schemas. The tested `gpt-5.5` profile sends function, custom (`apply_patch`), and deferred tool-search definitions, all of which this adapter translates to ordinary Chat Completions functions. Avoid a code-mode-only profile unless your provider implements that profile's native server-side tools; current Codex versions can omit client tool schemas for those profiles.
+
+For the first validation run, start the router without its optional debug prefix:
+
+```bash
+python -m openclaw_router --config openclaw_router/config.yaml --no-prefix
+codex
+```
+
+The Responses adapter supports streaming text, function and namespace tools, custom tools such as `apply_patch`, deferred tool search, parallel tool-call forwarding, supported image/audio preprocessing, and every corresponding tool output. Common generation settings such as `temperature`, `top_p`, and output limits are forwarded. Routing and fallback automatically exclude backends whose configured context window cannot fit the request. Backend models still need reliable tool-calling support for agentic Codex tasks.
+
+To identify the actual backend selected by the router, enable `serve.show_model_suffix`. Final text answers end with `[model: <configured upstream model id>]`; tool-call turns remain unchanged so the client tool loop stays machine-readable. When both suffix and legacy prefix settings are enabled, the suffix takes precedence.
+
+To repeat the full local transport/tool-loop smoke test without API keys:
+
+```bash
+PYTHON_BIN=python3 ./scripts/test-codex-integration.sh
+```
+
+The script starts a local Chat Completions mock and this router, invokes the real Codex CLI against `/v1/responses`, and verifies function, `apply_patch`, and deferred tool-search round trips before stopping both servers. Set `CODEX_COMMAND` if Codex is installed under a different command; otherwise it uses `npx --yes @openai/codex`.
+
 ## Step-by-Step (Recommended: One Script Starts Router + Gateway)
 
 ### 1) Configure OpenClaw Router backends (API keys live here)
@@ -123,7 +163,8 @@ Example: Together (OpenAI-compatible)
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 router:
   strategy: llm
@@ -320,7 +361,8 @@ Minimal shape:
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 router:
   strategy: random   # random | round_robin | rules | llm | llmrouter
@@ -338,10 +380,13 @@ llms:
     description: "..."
     max_tokens: 1024
     context_limit: 128000
+    input_price: 0.2     # USD per 1M input tokens
+    output_price: 0.2    # USD per 1M output tokens
 ```
 
 Key fields:
 - `serve.host` / `serve.port`: where OpenClaw Router listens.
+- `serve.show_model_suffix`: append `[model: <upstream model id>]` to completed text answers. It is omitted on tool-call turns and takes precedence over `show_model_prefix`.
 - `router.strategy`:
   - `random` / `round_robin` / `rules`: deterministic/simple routing.
   - `llm`: uses a "router LLM" to pick the backend model.
@@ -352,6 +397,8 @@ Key fields:
   - Supports environment variables like `${TOGETHER_API_KEY}`.
 - `llms`: your backend model pool (the Router chooses one of these for each request).
   - You can mix frameworks in one pool (for example `sglang`, `vllm`, `llama_cpp`, `lmstudio`, `huggingface_cli`, cloud providers).
+  - `context_limit` and `max_tokens` constrain routing and output generation.
+  - `input_price` and `output_price` are USD per one million tokens; completed requests emit structured `[Usage]` accounting logs.
 
 OpenAI-compatible adapter fields (supported in both `router` and each `llms.<name>`):
 - `provider_type`: currently `openai_compatible` (reserved for future extension).
@@ -544,7 +591,7 @@ This is the recommended entry point for Slack: it starts both OpenClaw Router an
 | `-r, --router NAME` | Router name or built-in strategy (e.g. `random`, `llm`, `knnrouter`) |
 | `--router-config FILE` | Router-specific config file path (optional; auto-detected if omitted) |
 | `--no-gateway` | Don't start OpenClaw Gateway |
-| `--no-prefix` | Don't add model name prefix to responses |
+| `--no-prefix` | Disable model prefix and suffix attribution in responses |
 | `--list-routers` | List available original LLMRouter routers |
 | `-h, --help` | Show help message |
 
@@ -573,6 +620,7 @@ Once running, the following endpoints are available:
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
+| `/v1/responses` | POST | Responses API adapter for Codex custom providers |
 | `/v1/models` | GET | List available models |
 | `/v1/chat/ws` | WS | Real-time streaming chat (WebSocket) |
 | `/routers` | GET | List available routing strategies |

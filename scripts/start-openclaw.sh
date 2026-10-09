@@ -39,7 +39,7 @@ show_help() {
     echo "  -r, --router NAME       Use specified router (e.g., knnrouter, mlprouter, randomrouter)"
     echo "  --router-config FILE    Router config file path"
     echo "  --no-gateway            Don't start OpenClaw Gateway"
-    echo "  --no-prefix             Don't add model name prefix to responses"
+    echo "  --no-prefix             Disable model prefix and suffix attribution"
     echo "  --list-routers          List all available routers"
     echo "  -h, --help              Show this help message"
     echo ""

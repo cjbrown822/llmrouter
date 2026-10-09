@@ -497,9 +497,18 @@ class OpenClawRouter:
                     model_path=config.router.llmrouter_model_path,
                 )
 
-    async def select_model(self, query: str, user: Optional[str] = None) -> str:
-        """Select model based on configured strategy."""
-        models = list(self.config.llms.keys())
+    async def select_model(
+        self,
+        query: str,
+        user: Optional[str] = None,
+        candidate_models: Optional[List[str]] = None,
+    ) -> str:
+        """Select a model, optionally constrained to an eligible candidate set."""
+        if candidate_models is None:
+            models = list(self.config.llms.keys())
+        else:
+            allowed = set(candidate_models)
+            models = [name for name in self.config.llms if name in allowed]
 
         if not models:
             return "default"

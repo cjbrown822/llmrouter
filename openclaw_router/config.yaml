@@ -5,7 +5,8 @@
 serve:
   host: "0.0.0.0"
   port: 8000
-  show_model_prefix: true
+  show_model_prefix: false
+  show_model_suffix: true
 
 # Routing Strategy
 # Options: random, round_robin, rules, llm, llmrouter
@@ -31,6 +32,7 @@ api_keys:
   together: "Your-Together-API-Key"
 
 # LLM Backend Configuration (Together-hosted models)
+# input_price/output_price are USD per one million tokens.
 llms:
   llama-3.1-8b:
     description: "Fast general chat"
