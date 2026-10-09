@@ -306,10 +306,11 @@ def create_app(config: ServeConfig = None, config_path: str = None) -> FastAPI:
         if request.stream:
             async def generate():
                 first_chunk = True
-                async for chunk in llm_backend.call(
+                stream = await llm_backend.call(
                     selected_model, messages, request.max_tokens,
                     request.temperature, stream=True
-                ):
+                )
+                async for chunk in stream:
                     # Add model prefix
                     if first_chunk and config.show_model_prefix and "content" in chunk:
                         try:
@@ -367,10 +368,11 @@ def create_app(config: ServeConfig = None, config_path: str = None) -> FastAPI:
 
             # Call LLM backend in streaming mode
             first_chunk = True
-            async for chunk in llm_backend.call(
+            stream = await llm_backend.call(
                 selected_model, messages, request.max_tokens,
                 request.temperature, stream=True
-            ):
+            )
+            async for chunk in stream:
                 # Add model prefix
                 if first_chunk and config.show_model_prefix and "content" in chunk:
                     try:
