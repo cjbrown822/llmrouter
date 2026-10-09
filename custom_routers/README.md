@@ -78,6 +78,26 @@ llmrouter infer --router thresholdrouter \
 - `learning_rate`: Training learning rate
 - `train_epoch`: Number of training epochs
 
+### 3. RouteFMPluginRouter
+
+**Type:** Pretrained frozen router (no target-domain router training)
+
+**Description:** Builds a small behavioral Context from LLMRouter's historical
+performance rows, then uses the released RouteFM-BGE checkpoint to route new
+queries across the configured candidate pool.
+
+```bash
+python -m pip install -e ".[routefm]"
+llmrouter infer --router routefm_router \
+  --config custom_routers/routefm_router/config.yaml \
+  --query "Prove that there are infinitely many primes." \
+  --route-only
+```
+
+See [`routefm_router/README.md`](routefm_router/README.md) for the data contract,
+configuration, and the distinction between BGE and LLMRouter's bundled
+Longformer embeddings.
+
 ## Creating Your Own Router
 
 See [CUSTOM_ROUTER_SUMMARY.md](../CUSTOM_ROUTER_SUMMARY.md) for detailed guide.

@@ -1,0 +1,27 @@
+data_path:
+  routing_data_train: 'data/example_data/routing_data/default_routing_train_data.jsonl'
+  llm_data: 'data/example_data/llm_candidates/default_llm.json'
+
+hparam:
+  # RouteFM was trained for behavioral Context, not LLMRouter's Longformer vectors.
+  # Query text is re-embedded with the compatible, pinned BGE encoder.
+  context_size: 8
+  context_seed: 31010
+  context_key: embedding_id
+  device: cpu
+  embedding_batch_size: 32
+  embedding_max_length: 512
+
+  # Optional controls:
+  # candidate_models: [qwen2.5-7b-instruct, llama-3.1-8b-instruct]
+  # cost_column: observed_cost
+  # checkpoint: /path/to/local/model.safetensors
+  # cache_dir: /path/to/huggingface/cache
+
+metric:
+  weights:
+    performance: 1
+    cost: 0
+    llm_judge: 0
+
+api_endpoint: 'https://integrate.api.nvidia.com/v1'
